@@ -67,6 +67,7 @@ import { UpdateService } from "vs/server/src/node/update";
 import { AuthType, getMediaMime, getUriTransformer, hash, localRequire, tmpdir } from "vs/server/src/node/util";
 import { RemoteExtensionLogFileName } from "vs/workbench/services/remote/common/remoteAgentService";
 import { IWorkbenchConstructionOptions } from "vs/workbench/workbench.web.api";
+import { Interface } from "readline";
 
 const tarFs = localRequire<typeof import("tar-fs")>("tar-fs/index");
 
@@ -102,8 +103,59 @@ export interface LoginPayload {
 	password?: string;
 }
 
+export interface OpenidCallbackPayload {
+	code: string;
+	state: string;
+}
+
+export interface TokenResponse {
+	access_token?: string;
+	token_type?: string;
+	expires_in?: number;
+	scope?: string;
+	refresh_token?: number;
+	id_token?: string;
+	error?: string;
+	error_description?: string;
+}
+
+export interface IntrospectResponse {
+	active?: boolean;
+	aud?: string;
+	client_id?: string;
+	device_id?: string;
+	exp?: number;
+	iat?: number;
+	iss?: string;
+	jti?: string;
+	nbf?: number;
+	scope?: string;
+	sub?: string;
+	token_type?: string;
+	uid?: string;
+	username?: string;
+	error?: string;
+	error_description?: string;
+}
+
 export interface AuthPayload {
+}
+
+export interface PasswordAuthPayload extends AuthPayload {
 	key?: string[];
+}
+export interface OpenidAuthPayload extends AuthPayload {
+	state?: string;
+}
+
+export interface AuthEntry {
+}
+
+export interface PasswordAuthEntry extends AuthEntry, PasswordAuthPayload {
+}
+
+export interface OpenidAuthEntry extends AuthEntry, IntrospectResponse, Interface {
+	state?: string;
 }
 
 export class HttpError extends Error {
@@ -126,6 +178,15 @@ export interface ServerOptions {
 	readonly password?: string;
 	readonly port?: number;
 	readonly socket?: string;
+	readonly openidClientId?: string;
+	readonly openidClientSecret?: string;
+	readonly openidScope?: string;
+	readonly openidAuthServer?: string;
+	readonly openidResponseType?: string;
+	readonly openidGrantType?: string;
+	readonly openidAuthorizeEndpoint?: string;
+	readonly openidTokenEndpoint?: string;
+	readonly openidIntrospectEndpoint?: string;
 }
 
 export abstract class Server {
@@ -134,6 +195,7 @@ export abstract class Server {
 	protected serverRoot = path.join(this.rootPath, "/out/vs/server/src");
 	protected readonly allowedRequestPaths: string[] = [this.rootPath];
 	private listenPromise: Promise<string> | undefined;
+	private authCache: {[key: string]: AuthEntry};
 	public readonly protocol: "http" | "https";
 	public readonly options: ServerOptions;
 
@@ -154,6 +216,7 @@ export abstract class Server {
 		} else {
 			this.server = http.createServer(this.onRequest);
 		}
+		this.authCache = {};
 	}
 
 	public listen(): Promise<string> {
@@ -236,9 +299,17 @@ export abstract class Server {
 		try {
 			const parsedUrl = request.url ? url.parse(request.url, true) : { query: {}};
 			const payload = await this.preHandleRequest(request, parsedUrl);
+			let redirectUrl:string = "";
+			if (payload.redirect) {
+				try {
+					redirectUrl = new URL(payload.redirect).toString();
+				} catch (_) {
+					redirectUrl = this.withBase(request, payload.redirect);
+				}
+			}
 			response.writeHead(payload.redirect ? HttpCode.Redirect : payload.code || HttpCode.Ok, {
 				"Content-Type": payload.mime || getMediaMime(payload.filePath),
-				...(payload.redirect ? { Location: this.withBase(request, payload.redirect) } : {}),
+				...(payload.redirect ? { Location: redirectUrl} : {}),
 				...(request.headers["service-worker"] ? { "Service-Worker-Allowed": this.options.basePath || "/" } : {}),
 				...(payload.cache ? { "Cache-Control": "public, max-age=31536000" } : {}),
 				...payload.headers,
@@ -314,10 +385,15 @@ export abstract class Server {
 				response.cache = true;
 				return response;
 			case "/login":
-				if (this.options.auth !== "password" || requestPath !== "/index.html") {
+				if (this.options.auth === AuthType.None || requestPath !== "/index.html") {
 					throw new HttpError("Not found", HttpCode.NotFound);
 				}
 				return this.tryLogin(request);
+			case "/openid":
+				if (this.options.auth !== AuthType.Openid) {
+					throw new HttpError("Not found", HttpCode.NotFound);
+				}
+				return this.openidCallback(request);
 			default:
 				if (!this.authenticate(request)) {
 					throw new HttpError("Unauthorized", HttpCode.Unauthorized);
@@ -365,6 +441,16 @@ export abstract class Server {
 	}
 
 	private async tryLogin(request: http.IncomingMessage): Promise<Response> {
+		if (this.options.auth === AuthType.Password) {
+			return this.tryPasswordLogin(request);
+		}
+		else if (this.options.auth === AuthType.Openid) {
+			return this.tryOpenidLogin(request);
+		}
+		throw new HttpError("Invalid authentication method", HttpCode.Unauthorized);
+	}
+
+	private async tryPasswordLogin(request: http.IncomingMessage): Promise<Response> {
 		const redirect = (password: string | true) => {
 			return {
 				redirect: "/",
@@ -373,13 +459,13 @@ export abstract class Server {
 					: {},
 			};
 		};
-		const providedPassword = this.authenticate(request);
+		const providedPassword = this.passwordAuthenticate(request);
 		if (providedPassword && (request.method === "GET" || request.method === "POST")) {
 			return redirect(providedPassword);
 		}
 		if (request.method === "POST") {
 			const data = await this.getData<LoginPayload>(request);
-			const password = this.authenticate(request, {
+			const password = this.passwordAuthenticate(request, {
 				key: typeof data.password === "string" ? [hash(data.password)] : undefined,
 			});
 			if (password) {
@@ -395,6 +481,76 @@ export abstract class Server {
 		}
 		this.ensureGet(request);
 		return this.getLogin();
+	}
+
+	private async tryOpenidLogin(request: http.IncomingMessage): Promise<Response> {
+		if (this.openidAuthenticate(request)) {
+			return {redirect: "/"};
+		}
+		const redirectUri = `${this.address()}/openid`;
+		const state = generateUuid().split("-").join("");
+		const authUrl = `${this.options.openidAuthServer}${this.options.openidAuthorizeEndpoint}?
+			response_type=${this.options.openidResponseType}&
+			client_id=${this.options.openidClientId}&
+			redirect_uri=${redirectUri}&
+			state=${state}&
+			scope=${this.options.openidScope}`;
+		return {
+			redirect: authUrl
+		};
+	}
+
+	private async openidCallback(request: http.IncomingMessage): Promise<Response> {
+		const queryData = url.parse(request.url!, true).query;
+		const redirectUri = `${this.address()}/openid`;
+		const tokenUrl = `${this.options.openidAuthServer}${this.options.openidTokenEndpoint}?
+			grant_type=${this.options.openidGrantType}&
+			code=${queryData.code}&
+			redirect_uri=${redirectUri}&
+			client_id=${this.options.openidClientId}&
+			client_secret=${this.options.openidClientSecret}`;
+		const options = {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/x-www-form-urlencoded"
+			}
+		};
+		const tokenResp = await new Promise<TokenResponse>(resolve => {
+			let req = https.request(tokenUrl, options, res => {
+				resolve(this.getData<TokenResponse>(res));
+			});
+			req.end();
+		});
+		if (tokenResp.error) {
+			throw new Error(tokenResp.error_description);
+		}
+		const introspectUrl = `${this.options.openidAuthServer}${this.options.openidIntrospectEndpoint}?
+			token=${tokenResp.access_token}&
+			token_type_hint=access_token`;
+		const introspectResp = await new Promise<IntrospectResponse>(resolve => {
+			let req = https.request(introspectUrl,
+				{
+					...options,
+					auth: `${this.options.openidClientId}:${this.options.openidClientSecret}`
+				}, res => {
+				resolve(this.getData<TokenResponse>(res));
+			});
+			req.end();
+		});
+		if (introspectResp.error) {
+			throw new Error(introspectResp.error_description);
+		}
+		const authEntry = {...introspectResp, state: queryData.state} as OpenidAuthPayload;
+		if (typeof queryData.state === "object") {
+			throw new Error("Invalid state in callback");
+		}
+		this.authCache[queryData.state] = authEntry;
+		return {
+			redirect: "/",
+			headers: {
+				"Set-Cookie": `state=${queryData.state}; Path=${this.options.basePath || "/"}; HttpOnly; SameSite=Lax`
+			}
+		};
 	}
 
 	private async getLogin(error: string = "", payload?: LoginPayload): Promise<Response> {
@@ -413,43 +569,67 @@ export abstract class Server {
 	}
 
 	private getData<T extends object>(request: http.IncomingMessage): Promise<T> {
-		return request.method === "POST"
-			? new Promise<T>((resolve, reject) => {
-				let body = "";
-				const onEnd = (): void => {
-					off();
+		return new Promise<T>((resolve, reject) => {
+			let body = "";
+			const onEnd = (): void => {
+				off();
+				const contentType = request.headers["content-type"] as string;
+				if (contentType.indexOf("application/json") !== -1) {
+					resolve(JSON.parse(body) as T);
+				} else {
 					resolve(querystring.parse(body) as T);
-				};
-				const onError = (error: Error): void => {
-					off();
-					reject(error);
-				};
-				const onData = (d: Buffer): void => {
-					body += d;
-					if (body.length > 1e6) {
-						onError(new HttpError("Payload is too large", HttpCode.LargePayload));
-						request.connection.destroy();
-					}
-				};
-				const off = (): void => {
-					request.off("error", onError);
-					request.off("data", onError);
-					request.off("end", onEnd);
-				};
-				request.on("error", onError);
-				request.on("data", onData);
-				request.on("end", onEnd);
-			})
-			: Promise.resolve({} as T);
+				}
+			};
+			const onError = (error: Error): void => {
+				off();
+				reject(error);
+			};
+			const onData = (d: Buffer): void => {
+				body += d;
+				if (body.length > 1e6) {
+					onError(new HttpError("Payload is too large", HttpCode.LargePayload));
+					request.connection.destroy();
+				}
+			};
+			const off = (): void => {
+				request.off("error", onError);
+				request.off("data", onError);
+				request.off("end", onEnd);
+			};
+			request.on("error", onError);
+			request.on("data", onData);
+			request.on("end", onEnd);
+		});
 	}
 
-	private authenticate(request: http.IncomingMessage, payload?: AuthPayload): string | boolean {
-		if (this.options.auth === "none") {
-			return true;
+	private authenticate(request: http.IncomingMessage, payload?: AuthPayload): string | boolean | IntrospectResponse {
+		switch (this.options.auth) {
+			case AuthType.None:
+				return this.noneAuthenticate(request, payload);	
+			case AuthType.Password:
+				return this.passwordAuthenticate(request, payload);
+			case AuthType.Openid:
+				return this.openidAuthenticate(request, payload);
+			default:
+				break;
+		}
+		return false;
+	}
+
+	private noneAuthenticate(request: http.IncomingMessage, payload?: AuthPayload): string | boolean {
+		if (this.options.auth !== AuthType.None) {
+			return false;
+		}
+		return true;
+	}
+
+	private passwordAuthenticate(request: http.IncomingMessage, payload?: PasswordAuthPayload): string | boolean {
+		if (this.options.auth !== AuthType.Password) {
+			return false;
 		}
 		const safeCompare = localRequire<typeof import("safe-compare")>("safe-compare/index");
 		if (typeof payload === "undefined") {
-			payload = this.parseCookies<AuthPayload>(request);
+			payload = this.parseCookies<PasswordAuthPayload>(request);
 		}
 		if (this.options.password && payload.key) {
 			for (let i = 0; i < payload.key.length; ++i) {
@@ -457,6 +637,21 @@ export abstract class Server {
 					return payload.key[i];
 				}
 			}
+		}
+		return false;
+	}
+
+	private openidAuthenticate(request: http.IncomingMessage, payload?: OpenidAuthPayload): IntrospectResponse | boolean {
+		if (typeof payload === "undefined") {
+			payload = this.parseCookies<OpenidAuthPayload>(request);
+		}
+		if (payload.state && this.authCache[payload.state]) {
+			const entry = this.authCache[payload.state];
+			if ((entry as OpenidAuthEntry).exp <= Date.now()) {
+				delete this.authCache[payload.state];
+				return false;
+			}
+			return entry;
 		}
 		return false;
 	}

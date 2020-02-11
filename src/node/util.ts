@@ -14,6 +14,7 @@ import { mkdirp } from "vs/base/node/pfs";
 
 export enum AuthType {
 	Password = "password",
+	Openid = "openid",
 	None = "none",
 }
 

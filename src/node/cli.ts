@@ -26,6 +26,15 @@ interface Args extends ParsedArgs {
 	open?: boolean;
 	port?: string;
 	socket?: string;
+	"openid-client-id"?: string;
+	"openid-client-secret"?: string;
+	"openid-scope"?: string;
+	"openid-auth-server"?: string;
+	"openid-response-type"?: string;
+	"openid-grant-type"?: string;
+	"openid-authorize-endpoint"?: string;
+	"openid-token-endpoint"?: string;
+	"openid-introspect-endpoint"?: string;
 }
 
 // @ts-ignore: Force `keyof Args` to work.
@@ -65,6 +74,15 @@ const getArgs = (): Args => {
 	options["open"] = { type: "boolean", cat: "o", description: "Open in the browser on startup." };
 	options["port"] = { type: "string", cat: "o", description: "Port for the main server." };
 	options["socket"] = { type: "string", cat: "o", description: "Listen on a socket instead of host:port." };
+	options["openid-client-id"] = { type: "string", cat: "o", description: "Openid client id."};
+	options["openid-client-secret"] = { type: "string", cat: "o", description: "Openid client secret."};
+	options["openid-scope"] = { type: "string", cat: "o", description: "Openid scope."};
+	options["openid-auth-server"] = { type: "string", cat: "o", description: "Openid authorization server url."};
+	options["openid-response-type"] = { type: "string", cat: "o", description: "Openid authorization resposne type. Currently only support code."};
+	options["openid-grant-type"] = { type: "string", cat: "o", description: "Openid mechanism used to authorize the creation of tokens. Currently only support authorization_code."};
+	options["openid-authorize-endpoint"] = { type: "string", cat: "o", description: "Openid authorization endpoint."};
+	options["openid-token-endpoint"] = { type: "string", cat: "o", description: "Openid token endpoint."};
+	options["openid-introspect-endpoint"] = { type: "string", cat: "o", description: "Openid introspect endpoint."};
 
 	const args = parseMainProcessArgv(process.argv);
 	if (!args["user-data-dir"]) {
@@ -91,6 +109,15 @@ const startVscode = async (args: Args): Promise<void | void[]> => {
 		openUri: extra.length > 1 ? extra[extra.length - 1] : undefined,
 		host: args.host,
 		password: process.env.PASSWORD,
+		openidClientId: args["openid-client-id"],
+		openidClientSecret: args["openid-client-secret"],
+		openidScope: args["openid-scope"],
+		openidAuthServer: args["openid-auth-server"],
+		openidResponseType: args["openid-response-type"],
+		openidGrantType: args["openid-grant-type"],
+		openidAuthorizeEndpoint: args["openid-authorize-endpoint"],
+		openidTokenEndpoint: args["openid-token-endpoint"],
+		openidIntrospectEndpoint: args["openid-introspect-endpoint"],
 	};
 
 	if (enumToArray(AuthType).filter((t) => t === options.auth).length === 0) {
@@ -131,6 +158,8 @@ const startVscode = async (args: Args): Promise<void | void[]> => {
 		}
 	} else if (options.auth === "password") {
 		logger.info("  - Using custom password for authentication");
+	} else if (options.auth === AuthType.Openid) {
+		logger.info("  - Using openid for authentication");
 	} else {
 		logger.info("  - No authentication");
 	}
